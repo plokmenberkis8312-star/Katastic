@@ -1,0 +1,89 @@
+name: Build Katastic APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run tests
+        run: npm test
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Sync web app
+        run: npx cap sync android
+
+      - name: Configure stable release signing and version
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          VERSION_CODE: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          test -n "$KEYSTORE_BASE64" || { echo "Missing GitHub Actions secret ANDROID_KEYSTORE_BASE64. Configure all four Android signing secrets before building an update-safe APK."; exit 1; }
+          mkdir -p android/app/keystore
+          echo "$KEYSTORE_BASE64" | base64 --decode > android/app/keystore/katastic-release.jks
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import os, re
+          p = Path('android/app/build.gradle')
+          s = p.read_text()
+          s = re.sub(r'versionCode\s+\d+', 'versionCode ' + os.environ['VERSION_CODE'], s, count=1)
+          s = re.sub(r'versionName\s+[^\n]+', 'versionName "0.22.' + os.environ['VERSION_CODE'] + '"', s, count=1)
+          signing = '''
+signingConfigs {
+    release {
+        storeFile file("keystore/katastic-release.jks")
+        storePassword System.getenv("KEYSTORE_PASSWORD")
+        keyAlias System.getenv("KEY_ALIAS")
+        keyPassword System.getenv("KEY_PASSWORD")
+    }
+}
+'''
+          if 'signingConfigs {' not in s:
+              s = s.replace('android {', 'android {' + signing, 1)
+          s = re.sub(r'(buildTypes\s*\{\s*release\s*\{)', r'\1\n            signingConfig signingConfigs.release', s, count=1)
+          p.write_text(s)
+          PYCODE
+
+      - name: Build signed release APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease
+
+      - name: Upload update-compatible APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Katastic-release-apk
+          path: android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          
