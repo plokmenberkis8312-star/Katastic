@@ -2,11 +2,36 @@ name: Build Katastic APK
 
 on:
   workflow_dispatch:
+    inputs:
+      source_zip:
+        description: 'Nama atau lokasi ZIP sumber (nama bebas; kosong = deteksi otomatis jika hanya ada satu ZIP di repository)'
+        required: false
+        type: string
+        default: ''
+      apk_icon_png:
+        description: 'Nama PNG ikon APK, contoh Icon atau Icon.png (dicari di semua folder ZIP)'
+        required: false
+        type: string
+        default: ''
+      splash_png:
+        description: 'Nama PNG splash art, contoh Splash atau Splash.png (dicari di semua folder ZIP)'
+        required: false
+        type: string
+        default: ''
+      app_logo_png:
+        description: 'Nama PNG logo aplikasi, contoh Logo atau Logo.png (dicari di semua folder ZIP)'
+        required: false
+        type: string
+        default: ''
   push:
-    paths:
-      - 'katastic-source.zip'
-      - '.github/workflows/android.yml'
     branches: [main, master]
+    paths:
+      - '**/*.zip'
+      - '*.zip'
+      - '.github/workflows/android.yml'
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -15,42 +40,166 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract the single ZIP source
+      - name: Find and extract ZIP source
+        id: source
+        env:
+          REQUESTED_ZIP: ${{ inputs.source_zip }}
         run: |
-          test -f katastic-source.zip || { echo 'katastic-source.zip was not found in repository root'; exit 1; }
-          mkdir app
-          unzip -q katastic-source.zip -d app
-          test -f app/package.json || { echo 'package.json must be at the root inside katastic-source.zip'; exit 1; }
+          set -euo pipefail
+          if [ -n "$REQUESTED_ZIP" ]; then
+            ZIP_PATH="$REQUESTED_ZIP"
+            test -f "$ZIP_PATH" || { echo "ZIP tidak ditemukan: $ZIP_PATH"; exit 1; }
+          else
+            mapfile -t ZIPS < <(find . -type f -iname '*.zip' -not -path './.git/*' -not -path './extracted/*' -not -path './app/*' -printf '%p\n' | sort)
+            if [ "${#ZIPS[@]}" -ne 1 ]; then
+              echo "Isi source_zip dengan nama/lokasi ZIP, atau sisakan tepat satu ZIP di repository. Ditemukan: ${#ZIPS[@]}"
+              printf '%s\n' "${ZIPS[@]}"
+              exit 1
+            fi
+            ZIP_PATH="${ZIPS[0]}"
+          fi
+          mkdir -p extracted
+          unzip -q "$ZIP_PATH" -d extracted
+          mapfile -t PACKAGES < <(find extracted -mindepth 1 -maxdepth 7 -type f -name package.json -not -path '*/node_modules/*' -printf '%h\n' | sort)
+          if [ "${#PACKAGES[@]}" -ne 1 ]; then
+            echo "ZIP harus berisi tepat satu proyek dengan package.json."
+            printf '%s\n' "${PACKAGES[@]}"
+            exit 1
+          fi
+          APP_DIR="${PACKAGES[0]}"
+          test -f "$APP_DIR/capacitor.config.json" || { echo "capacitor.config.json tidak ditemukan di $APP_DIR"; exit 1; }
+          test -d "$APP_DIR/www" || { echo "Folder www tidak ditemukan di $APP_DIR"; exit 1; }
+          echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
+          echo "Sumber proyek ditemukan: $APP_DIR"
 
-      - name: Setup Node
+      - name: Setup Node and Java
         uses: actions/setup-node@v4
         with:
           node-version: 20
-
-      - name: Setup Java
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 21
 
-      - name: Install dependencies
-        working-directory: app
-        run: npm install
+      - name: Install project dependencies and asset tools
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          npm install --no-save @capacitor/assets
+          python3 -m pip install --quiet Pillow
 
-      - name: Run tests
-        working-directory: app
+      - name: Run project tests
+        working-directory: ${{ env.APP_DIR }}
         run: npm test
 
-      - name: Add Android platform
-        working-directory: app
-        run: npx cap add android
+      - name: Find selected PNGs anywhere in the ZIP and apply separately
+        working-directory: ${{ env.APP_DIR }}
+        env:
+          APK_ICON_PNG: ${{ inputs.apk_icon_png }}
+          SPLASH_PNG: ${{ inputs.splash_png }}
+          APP_LOGO_PNG: ${{ inputs.app_logo_png }}
+          ASSET_SEARCH_ROOT: ${{ github.workspace }}/extracted
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import os, re, shutil
+          from PIL import Image, ImageOps, ImageDraw, ImageFont
 
-      - name: Sync web app
-        working-directory: app
-        run: npx cap sync android
+          root = Path('.')
+          search_root = Path(os.environ.get('ASSET_SEARCH_ROOT', '.'))
+          web = root / 'www'
+          requests = {
+              'ikon APK': os.environ.get('APK_ICON_PNG', '').strip(),
+              'splash art': os.environ.get('SPLASH_PNG', '').strip(),
+              'logo aplikasi': os.environ.get('APP_LOGO_PNG', '').strip(),
+          }
+
+          def find_png(label, requested):
+              if not requested:
+                  return None
+              wanted = requested.strip()
+              if '/' in wanted or '\\' in wanted:
+                  raise SystemExit(f'Untuk {label}, isi nama file saja tanpa lokasi folder: {requested}')
+              if wanted.lower().endswith('.png'):
+                  wanted = wanted[:-4]
+              if not wanted or not re.fullmatch(r'[A-Za-z0-9_. -]+', wanted):
+                  raise SystemExit(f'Nama PNG {label} tidak valid: {requested}')
+              matches = [p for p in search_root.rglob('*')
+                         if p.is_file() and p.suffix.lower() == '.png'
+                         and p.stem.casefold() == wanted.casefold()
+                         and 'node_modules' not in p.parts
+                         and 'android' not in p.parts]
+              if not matches:
+                  raise SystemExit(f'PNG "{requested}" untuk {label} tidak ditemukan di folder mana pun dalam ZIP.')
+              if len(matches) > 1:
+                  paths = ', '.join(str(p) for p in matches)
+                  raise SystemExit(f'Nama PNG "{requested}" untuk {label} ditemukan lebih dari satu kali: {paths}. Sisakan satu file dengan nama itu agar tidak salah pilih.')
+              return matches[0]
+
+          selected = {label: find_png(label, name) for label, name in requests.items()}
+          chosen = [(label, path) for label, path in selected.items() if path is not None]
+          used = [p.resolve() for _, p in chosen]
+          if len(used) != len(set(used)):
+              raise SystemExit('Satu file PNG tidak boleh dipakai untuk beberapa fungsi. Gunakan file yang berbeda.')
+
+          assets = root / 'assets'
+          assets.mkdir(exist_ok=True)
+
+          icon_src = selected['ikon APK'] or (web / 'icon-512.png')
+          if not icon_src.is_file():
+              raise SystemExit(f'Ikon bawaan tidak ditemukan: {icon_src}. Isi kolom APK Icon PNG.')
+          with Image.open(icon_src) as im:
+              src = im.convert('RGBA')
+          icon = Image.new('RGBA', (1024, 1024), (0, 0, 0, 0))
+          fitted = ImageOps.contain(src, (900, 900), method=Image.Resampling.LANCZOS)
+          icon.alpha_composite(fitted, ((1024-fitted.width)//2, (1024-fitted.height)//2))
+          icon.save(assets / 'icon-only.png')
+          icon.save(assets / 'icon-foreground.png')
+          Image.new('RGBA', (1024, 1024), (200, 36, 43, 255)).save(assets / 'icon-background.png')
+
+          splash_src = selected['splash art']
+          if splash_src:
+              with Image.open(splash_src) as im:
+                  splash_image = im.convert('RGBA')
+              splash = ImageOps.fit(splash_image, (2732, 2732), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+          else:
+              splash = Image.new('RGBA', (2732, 2732), (248, 248, 248, 255))
+              draw = ImageDraw.Draw(splash)
+              try:
+                  font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', 520)
+              except OSError:
+                  font = ImageFont.load_default()
+              box = draw.textbbox((0, 0), 'K', font=font)
+              draw.text(((2732-(box[2]-box[0]))/2, (2732-(box[3]-box[1]))/2-box[1]), 'K', fill=(200,36,43,255), font=font)
+          splash.save(assets / 'splash.png')
+
+          logo_src = selected['logo aplikasi']
+          if logo_src:
+              shutil.copy2(logo_src, web / 'katastic-header-logo.png')
+              css = web / 'style.css'
+              if not css.is_file():
+                  raise SystemExit('www/style.css tidak ditemukan; tidak bisa memasang logo aplikasi.')
+              css_text = css.read_text(encoding='utf-8')
+              css_text += '\n\n/* Logo header Katastic: dibuat oleh GitHub Actions */\n.logo { background: url("katastic-header-logo.png") center / contain no-repeat !important; }\n.logo::after { content: none !important; }\n'
+              css.write_text(css_text, encoding='utf-8')
+
+          print('PNG terpilih:')
+          for label, path in selected.items():
+              print(f' - {label}: {path if path else "bawaan/tidak diganti"}')
+          PY
+
+      - name: Add Android platform and generate native assets
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          if [ ! -d android ]; then npx cap add android; fi
+          npx capacitor-assets generate --android --assetPath assets
+          npx cap sync android
 
       - name: Configure stable release signing and version
-        working-directory: app
+        working-directory: ${{ env.APP_DIR }}
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -59,37 +208,62 @@ jobs:
           VERSION_CODE: ${{ github.run_number }}
         run: |
           set -euo pipefail
-          test -n "$KEYSTORE_BASE64" || { echo "Missing signing secrets. Add all four Android signing secrets before building a release APK."; exit 1; }
+          test -n "$KEYSTORE_BASE64" || { echo 'Secret ANDROID_KEYSTORE_BASE64 belum diatur.'; exit 1; }
+          test -n "$KEYSTORE_PASSWORD" || { echo 'Secret ANDROID_KEYSTORE_PASSWORD belum diatur.'; exit 1; }
+          test -n "$KEY_ALIAS" || { echo 'Secret ANDROID_KEY_ALIAS belum diatur.'; exit 1; }
+          test -n "$KEY_PASSWORD" || { echo 'Secret ANDROID_KEY_PASSWORD belum diatur.'; exit 1; }
           mkdir -p android/app/keystore
-          echo "$KEYSTORE_BASE64" | base64 --decode > android/app/keystore/katastic-release.jks
-          python3 - <<'PYCODE'
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > android/app/keystore/katastic-release.jks
+          python3 - <<'PY'
           from pathlib import Path
-          import os, re
-          p = Path('android/app/build.gradle')
-          s = p.read_text()
-          s = re.sub(r'versionCode\s+\d+', 'versionCode ' + os.environ['VERSION_CODE'], s, count=1)
-          s = re.sub(r'versionName\s+[^\n]+', 'versionName "0.22.' + os.environ['VERSION_CODE'] + '"', s, count=1)
+          import json, os, re
+          pkg = json.loads(Path('package.json').read_text())
+          version = pkg.get('version', '1.0.0') + '+' + os.environ['VERSION_CODE']
+          gradle = Path('android/app/build.gradle')
+          if not gradle.exists():
+              raise SystemExit('android/app/build.gradle tidak ditemukan.')
+          s = gradle.read_text()
+          s, n = re.subn(r'versionCode\s+\d+', 'versionCode ' + os.environ['VERSION_CODE'], s, count=1)
+          if not n: raise SystemExit('versionCode tidak ditemukan di build.gradle')
+          s, n = re.subn(r'versionName\s+["\'][^"\']*["\']', 'versionName "' + version + '"', s, count=1)
+          if not n: raise SystemExit('versionName tidak ditemukan di build.gradle')
           signing = '''\nsigningConfigs {\n    release {\n        storeFile file("keystore/katastic-release.jks")\n        storePassword System.getenv("KEYSTORE_PASSWORD")\n        keyAlias System.getenv("KEY_ALIAS")\n        keyPassword System.getenv("KEY_PASSWORD")\n    }\n}\n'''
           if 'signingConfigs {' not in s:
               s = s.replace('android {', 'android {' + signing, 1)
           if 'signingConfig signingConfigs.release' not in s:
-              s = re.sub(r'(buildTypes\s*\{\s*release\s*\{)', r'\1\n            signingConfig signingConfigs.release', s, count=1)
-          p.write_text(s)
-          PYCODE
+              s, n = re.subn(r'(buildTypes\s*\{\s*release\s*\{)', r'\1\n            signingConfig signingConfigs.release', s, count=1)
+              if not n: raise SystemExit('Blok buildTypes.release tidak ditemukan.')
+          gradle.write_text(s)
+          with open(os.environ['GITHUB_ENV'], 'a') as env_file:
+              env_file.write('VERSION_NAME=' + version + '\n')
+          PY
 
       - name: Build signed release APK
-        working-directory: app/android
+        working-directory: ${{ env.APP_DIR }}/android
         env:
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
+          set -euo pipefail
           chmod +x gradlew
           ./gradlew assembleRelease
+          cp app/build/outputs/apk/release/app-release.apk "../Katastic-${VERSION_NAME}.apk"
 
-      - name: Upload APK
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION_NAME }}
+          name: Katastic v${{ env.VERSION_NAME }}
+          files: ${{ env.APP_DIR }}/Katastic-${{ env.VERSION_NAME }}.apk
+          generate_release_notes: true
+          make_latest: true
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Katastic-release-apk
-          path: app/android/app/build/outputs/apk/release/app-release.apk
+          name: Katastic-release-${{ github.run_number }}
+          path: ${{ env.APP_DIR }}/Katastic-${{ env.VERSION_NAME }}.apk
           if-no-files-found: error
+          retention-days: 30
+          
