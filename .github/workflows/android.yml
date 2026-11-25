@@ -4,34 +4,32 @@ on:
   workflow_dispatch:
     inputs:
       source_zip:
-        description: 'Nama atau lokasi ZIP sumber (nama bebas; kosong = deteksi otomatis jika hanya ada satu ZIP di repository)'
+        description: 'Nama ZIP sumber di root repository (kosong = deteksi otomatis jika hanya ada satu ZIP)'
         required: false
         type: string
         default: ''
-      apk_icon_png:
-        description: 'Nama PNG ikon APK, contoh Icon atau Icon.png (dicari di semua folder ZIP)'
+      png_usage:
+        description: 'Pilih satu fungsi PNG saja; PNG tidak dipakai untuk beberapa fungsi sekaligus'
+        required: true
+        type: choice
+        options:
+          - none
+          - apk_icon
+          - web_icon
+        default: none
+      png_file:
+        description: 'Lokasi PNG relatif dari folder proyek, contoh: www/gdhdf.png (dipakai jika bukan none)'
         required: false
         type: string
-        default: ''
-      splash_png:
-        description: 'Nama PNG splash art, contoh Splash atau Splash.png (dicari di semua folder ZIP)'
-        required: false
-        type: string
-        default: ''
-      app_logo_png:
-        description: 'Nama PNG logo aplikasi, contoh Logo atau Logo.png (dicari di semua folder ZIP)'
-        required: false
-        type: string
-        default: ''
+        default: 'www/gdhdf.png'
   push:
     branches: [main, master]
     paths:
-      - '**/*.zip'
-      - '*.zip'
+      - '**.zip'
       - '.github/workflows/android.yml'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -46,13 +44,13 @@ jobs:
           REQUESTED_ZIP: ${{ inputs.source_zip }}
         run: |
           set -euo pipefail
-          if [ -n "$REQUESTED_ZIP" ]; then
-            ZIP_PATH="$REQUESTED_ZIP"
+          if [ -n "${REQUESTED_ZIP}" ]; then
+            ZIP_PATH="${REQUESTED_ZIP}"
             test -f "$ZIP_PATH" || { echo "ZIP tidak ditemukan: $ZIP_PATH"; exit 1; }
           else
-            mapfile -t ZIPS < <(find . -type f -iname '*.zip' -not -path './.git/*' -not -path './extracted/*' -not -path './app/*' -printf '%p\n' | sort)
+            mapfile -t ZIPS < <(find . -maxdepth 1 -type f -iname '*.zip' -printf '%f\n' | sort)
             if [ "${#ZIPS[@]}" -ne 1 ]; then
-              echo "Isi source_zip dengan nama/lokasi ZIP, atau sisakan tepat satu ZIP di repository. Ditemukan: ${#ZIPS[@]}"
+              echo "Isi source_zip saat menjalankan workflow, atau letakkan tepat satu file ZIP di root repository. Ditemukan: ${#ZIPS[@]}"
               printf '%s\n' "${ZIPS[@]}"
               exit 1
             fi
@@ -60,9 +58,9 @@ jobs:
           fi
           mkdir -p extracted
           unzip -q "$ZIP_PATH" -d extracted
-          mapfile -t PACKAGES < <(find extracted -mindepth 1 -maxdepth 7 -type f -name package.json -not -path '*/node_modules/*' -printf '%h\n' | sort)
+          mapfile -t PACKAGES < <(find extracted -mindepth 1 -maxdepth 4 -type f -name package.json -printf '%h\n')
           if [ "${#PACKAGES[@]}" -ne 1 ]; then
-            echo "ZIP harus berisi tepat satu proyek dengan package.json."
+            echo "ZIP harus berisi tepat satu proyek dengan package.json (boleh berada di dalam satu folder pembungkus)."
             printf '%s\n' "${PACKAGES[@]}"
             exit 1
           fi
@@ -70,133 +68,204 @@ jobs:
           test -f "$APP_DIR/capacitor.config.json" || { echo "capacitor.config.json tidak ditemukan di $APP_DIR"; exit 1; }
           test -d "$APP_DIR/www" || { echo "Folder www tidak ditemukan di $APP_DIR"; exit 1; }
           echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
-          echo "Sumber proyek ditemukan: $APP_DIR"
+          echo "Project ditemukan: $APP_DIR"
 
-      - name: Setup Node and Java
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
-      - uses: actions/setup-java@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 21
 
-      - name: Install project dependencies and asset tools
+      - name: Cache npm downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles(format('{0}/package.json', env.APP_DIR)) }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      - name: Install dependencies
         working-directory: ${{ env.APP_DIR }}
         run: |
           set -euo pipefail
           if [ -f package-lock.json ]; then npm ci; else npm install; fi
-          npm install --no-save @capacitor/assets
-          python3 -m pip install --quiet Pillow
 
       - name: Run project tests
         working-directory: ${{ env.APP_DIR }}
         run: npm test
 
-      - name: Find selected PNGs anywhere in the ZIP and apply separately
+      - name: Restore generated Android project
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.APP_DIR }}/android
+          key: ${{ runner.os }}-katastic-android-${{ hashFiles(format('{0}/package.json', env.APP_DIR), format('{0}/capacitor.config.json', env.APP_DIR)) }}
+
+      - name: Repair web precache and force fresh app cache
         working-directory: ${{ env.APP_DIR }}
         env:
-          APK_ICON_PNG: ${{ inputs.apk_icon_png }}
-          SPLASH_PNG: ${{ inputs.splash_png }}
-          APP_LOGO_PNG: ${{ inputs.app_logo_png }}
-          ASSET_SEARCH_ROOT: ${{ github.workspace }}/extracted
+          BUILD_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          import os, re, shutil
-          from PIL import Image, ImageOps, ImageDraw, ImageFont
+          import re, os, json
 
-          root = Path('.')
-          search_root = Path(os.environ.get('ASSET_SEARCH_ROOT', '.'))
-          web = root / 'www'
-          requests = {
-              'ikon APK': os.environ.get('APK_ICON_PNG', '').strip(),
-              'splash art': os.environ.get('SPLASH_PNG', '').strip(),
-              'logo aplikasi': os.environ.get('APP_LOGO_PNG', '').strip(),
-          }
+          web = Path("www")
+          sw = web / "sw.js"
+          if not sw.is_file():
+              raise SystemExit("www/sw.js tidak ditemukan.")
 
-          def find_png(label, requested):
-              if not requested:
-                  return None
-              wanted = requested.strip()
-              if '/' in wanted or '\\' in wanted:
-                  raise SystemExit(f'Untuk {label}, isi nama file saja tanpa lokasi folder: {requested}')
-              if wanted.lower().endswith('.png'):
-                  wanted = wanted[:-4]
-              if not wanted or not re.fullmatch(r'[A-Za-z0-9_. -]+', wanted):
-                  raise SystemExit(f'Nama PNG {label} tidak valid: {requested}')
-              matches = [p for p in search_root.rglob('*')
-                         if p.is_file() and p.suffix.lower() == '.png'
-                         and p.stem.casefold() == wanted.casefold()
-                         and 'node_modules' not in p.parts
-                         and 'android' not in p.parts]
-              if not matches:
-                  raise SystemExit(f'PNG "{requested}" untuk {label} tidak ditemukan di folder mana pun dalam ZIP.')
-              if len(matches) > 1:
-                  paths = ', '.join(str(p) for p in matches)
-                  raise SystemExit(f'Nama PNG "{requested}" untuk {label} ditemukan lebih dari satu kali: {paths}. Sisakan satu file dengan nama itu agar tidak salah pilih.')
-              return matches[0]
+          source = sw.read_text()
+          match = re.search(r"const\s+F\s*=\s*\[(.*?)\];", source, re.S)
+          if not match:
+              raise SystemExit("Daftar precache const F tidak ditemukan di sw.js.")
 
-          selected = {label: find_png(label, name) for label, name in requests.items()}
-          chosen = [(label, path) for label, path in selected.items() if path is not None]
-          used = [p.resolve() for _, p in chosen]
-          if len(used) != len(set(used)):
-              raise SystemExit('Satu file PNG tidak boleh dipakai untuk beberapa fungsi. Gunakan file yang berbeda.')
+          paths = re.findall(r"'([^']+)'", match.group(1))
+          missing = [p for p in paths if p != "./" and not (web / p).is_file()]
+          if missing:
+              print("Menghapus file precache yang memang tidak ada:")
+              for item in missing:
+                  print(f" - {item}")
+              kept = [p for p in paths if p not in missing]
+              array = "const F = [" + ", ".join(repr(p) for p in kept) + "];"
+              source = source[:match.start()] + array + source[match.end():]
 
-          assets = root / 'assets'
-          assets.mkdir(exist_ok=True)
+          # Cache name unik per build supaya WebView tidak terus memakai cache lama.
+          build = os.environ["BUILD_NUMBER"]
+          source, count = re.subn(
+              r"const\s+C\s*=\s*'[^']+';",
+              f"const C = 'katastic-build-{build}';",
+              source, count=1
+          )
+          if count != 1:
+              raise SystemExit("Deklarasi const C tidak ditemukan di sw.js.")
 
-          icon_src = selected['ikon APK'] or (web / 'icon-512.png')
-          if not icon_src.is_file():
-              raise SystemExit(f'Ikon bawaan tidak ditemukan: {icon_src}. Isi kolom APK Icon PNG.')
-          with Image.open(icon_src) as im:
-              src = im.convert('RGBA')
-          icon = Image.new('RGBA', (1024, 1024), (0, 0, 0, 0))
-          fitted = ImageOps.contain(src, (900, 900), method=Image.Resampling.LANCZOS)
-          icon.alpha_composite(fitted, ((1024-fitted.width)//2, (1024-fitted.height)//2))
-          icon.save(assets / 'icon-only.png')
-          icon.save(assets / 'icon-foreground.png')
-          Image.new('RGBA', (1024, 1024), (200, 36, 43, 255)).save(assets / 'icon-background.png')
+          # Ambil alih worker baru segera; cache lama dibersihkan saat aktivasi.
+          source = source.replace(
+              "caches.open(C).then(c => c.addAll(F))",
+              "caches.open(C).then(c => c.addAll(F)).then(() => self.skipWaiting())"
+          )
+          source = source.replace(
+              "k.filter(x => x !== C).map(x => caches.delete(x))",
+              "k.filter(x => x !== C).map(x => caches.delete(x))).then(() => self.clients.claim()"
+          )
+          sw.write_text(source)
 
-          splash_src = selected['splash art']
-          if splash_src:
-              with Image.open(splash_src) as im:
-                  splash_image = im.convert('RGBA')
-              splash = ImageOps.fit(splash_image, (2732, 2732), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
-          else:
-              splash = Image.new('RGBA', (2732, 2732), (248, 248, 248, 255))
-              draw = ImageDraw.Draw(splash)
-              try:
-                  font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', 520)
-              except OSError:
-                  font = ImageFont.load_default()
-              box = draw.textbbox((0, 0), 'K', font=font)
-              draw.text(((2732-(box[2]-box[0]))/2, (2732-(box[3]-box[1]))/2-box[1]), 'K', fill=(200,36,43,255), font=font)
-          splash.save(assets / 'splash.png')
+          # ZIP v0.35 hanya menyertakan icon.png (192x192), sedangkan manifest
+          # lama menunjuk icon-192.png dan icon-512.png yang tidak ada.
+          icon = web / "icon.png"
+          manifest = web / "manifest.webmanifest"
+          if icon.is_file() and manifest.is_file():
+              data = json.loads(manifest.read_text())
+              data["icons"] = [{
+                  "src": "icon.png",
+                  "sizes": "192x192",
+                  "type": "image/png",
+                  "purpose": "any"
+              }]
+              manifest.write_text(json.dumps(data, ensure_ascii=False, indent=2) + chr(10))
 
-          logo_src = selected['logo aplikasi']
-          if logo_src:
-              shutil.copy2(logo_src, web / 'katastic-header-logo.png')
-              css = web / 'style.css'
-              if not css.is_file():
-                  raise SystemExit('www/style.css tidak ditemukan; tidak bisa memasang logo aplikasi.')
-              css_text = css.read_text(encoding='utf-8')
-              css_text += '\n\n/* Logo header Katastic: dibuat oleh GitHub Actions */\n.logo { background: url("katastic-header-logo.png") center / contain no-repeat !important; }\n.logo::after { content: none !important; }\n'
-              css.write_text(css_text, encoding='utf-8')
-
-          print('PNG terpilih:')
-          for label, path in selected.items():
-              print(f' - {label}: {path if path else "bawaan/tidak diganti"}')
+          print(f"Service Worker disiapkan untuk build {build}.")
           PY
 
-      - name: Add Android platform and generate native assets
+      - name: Add Android platform only when missing, then sync
         working-directory: ${{ env.APP_DIR }}
         run: |
           set -euo pipefail
-          if [ ! -d android ]; then npx cap add android; fi
-          npx capacitor-assets generate --android --assetPath assets
+          if [ ! -d android ]; then
+            echo "Android platform belum ada di cache; membuat platform pertama kali."
+            npx cap add android
+          else
+            echo "Menggunakan Android platform hasil cache."
+          fi
           npx cap sync android
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-katastic-gradle-${{ hashFiles(format('{0}/android/gradle/wrapper/gradle-wrapper.properties', env.APP_DIR), format('{0}/android/build.gradle', env.APP_DIR)) }}
+          restore-keys: |
+            ${{ runner.os }}-katastic-gradle-
+
+      - name: Apply optional PNG (one purpose only)
+        working-directory: ${{ env.APP_DIR }}
+        env:
+          PNG_USAGE: ${{ inputs.png_usage || 'none' }}
+          PNG_FILE: ${{ inputs.png_file || 'www/gdhdf.png' }}
+        run: |
+          set -euo pipefail
+          case "$PNG_USAGE" in
+            none)
+              echo "PNG tidak digunakan; ikon bawaan proyek tetap dipakai."
+              ;;
+            apk_icon|web_icon)
+              test -f "$PNG_FILE" || { echo "PNG tidak ditemukan: $PNG_FILE. Pastikan file berada di dalam folder proyek, misalnya www/gdhdf.png."; exit 1; }
+              python3 -m pip install --quiet Pillow
+              if [ "$PNG_USAGE" = "web_icon" ]; then
+                python3 - "$PNG_FILE" <<'PY'
+          from PIL import Image
+          from pathlib import Path
+          import sys
+          src = Image.open(sys.argv[1]).convert('RGBA')
+          def make_icon(size, output):
+              im = src.copy()
+              im.thumbnail((size, size), Image.Resampling.LANCZOS)
+              canvas = Image.new('RGBA', (size, size), (255,255,255,0))
+              canvas.alpha_composite(im, ((size-im.width)//2, (size-im.height)//2))
+              canvas.save(output, 'PNG', optimize=True)
+          make_icon(192, 'www/icon-192.png')
+          make_icon(512, 'www/icon-512.png')
+          PY
+              else
+                mkdir -p android-icon-input
+                cp "$PNG_FILE" android-icon-input/source.png
+                python3 - <<'PY'
+          from PIL import Image
+          from pathlib import Path
+          src = Image.open('android-icon-input/source.png').convert('RGBA')
+          res = Path('android/app/src/main/res')
+          sizes = {'mdpi':48, 'hdpi':72, 'xhdpi':96, 'xxhdpi':144, 'xxxhdpi':192}
+          def fit(size, padding=0):
+              canvas = Image.new('RGBA', (size,size), (200,36,43,255))
+              area = size - 2*padding
+              im = src.copy()
+              im.thumbnail((area,area), Image.Resampling.LANCZOS)
+              canvas.alpha_composite(im, ((size-im.width)//2, (size-im.height)//2))
+              return canvas
+          for density, size in sizes.items():
+              folder = res / f'mipmap-{density}'
+              folder.mkdir(parents=True, exist_ok=True)
+              fit(size).save(folder / 'ic_launcher.png', optimize=True)
+              fit(size).save(folder / 'ic_launcher_round.png', optimize=True)
+          anydpi = res / 'mipmap-anydpi-v26'
+          anydpi.mkdir(parents=True, exist_ok=True)
+          (anydpi / 'ic_launcher.xml').write_text('''<?xml version="1.0" encoding="utf-8"?>\n<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android"><background android:drawable="@color/ic_launcher_background"/><foreground android:drawable="@mipmap/ic_launcher_foreground"/></adaptive-icon>\n''')
+          (anydpi / 'ic_launcher_round.xml').write_text('''<?xml version="1.0" encoding="utf-8"?>\n<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android"><background android:drawable="@color/ic_launcher_background"/><foreground android:drawable="@mipmap/ic_launcher_foreground"/></adaptive-icon>\n''')
+          fg = Image.new('RGBA', (432,432), (0,0,0,0))
+          logo = src.copy(); logo.thumbnail((324,324), Image.Resampling.LANCZOS)
+          fg.alpha_composite(logo, ((432-logo.width)//2, (432-logo.height)//2))
+          fg_sizes = {'mdpi':108, 'hdpi':162, 'xhdpi':216, 'xxhdpi':324, 'xxxhdpi':432}
+          for density, size in fg_sizes.items():
+              folder = res / f'mipmap-{density}'
+              fg.resize((size,size), Image.Resampling.LANCZOS).save(folder / 'ic_launcher_foreground.png', optimize=True)
+          values = res / 'values'
+          values.mkdir(parents=True, exist_ok=True)
+          colors = values / 'ic_launcher_background.xml'
+          colors.write_text('''<?xml version="1.0" encoding="utf-8"?>\n<resources><color name="ic_launcher_background">#C8242B</color></resources>\n''')
+          PY
+              fi
+              ;;
+            *) echo "png_usage tidak valid: $PNG_USAGE"; exit 1 ;;
+          esac
+          npx cap copy android
 
       - name: Configure stable release signing and version
         working-directory: ${{ env.APP_DIR }}
@@ -208,34 +277,31 @@ jobs:
           VERSION_CODE: ${{ github.run_number }}
         run: |
           set -euo pipefail
-          test -n "$KEYSTORE_BASE64" || { echo 'Secret ANDROID_KEYSTORE_BASE64 belum diatur.'; exit 1; }
-          test -n "$KEYSTORE_PASSWORD" || { echo 'Secret ANDROID_KEYSTORE_PASSWORD belum diatur.'; exit 1; }
-          test -n "$KEY_ALIAS" || { echo 'Secret ANDROID_KEY_ALIAS belum diatur.'; exit 1; }
-          test -n "$KEY_PASSWORD" || { echo 'Secret ANDROID_KEY_PASSWORD belum diatur.'; exit 1; }
+          test -n "$KEYSTORE_BASE64" || { echo "Secret ANDROID_KEYSTORE_BASE64 belum diatur."; exit 1; }
+          test -n "$KEYSTORE_PASSWORD" || { echo "Secret ANDROID_KEYSTORE_PASSWORD belum diatur."; exit 1; }
+          test -n "$KEY_ALIAS" || { echo "Secret ANDROID_KEY_ALIAS belum diatur."; exit 1; }
+          test -n "$KEY_PASSWORD" || { echo "Secret ANDROID_KEY_PASSWORD belum diatur."; exit 1; }
           mkdir -p android/app/keystore
-          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > android/app/keystore/katastic-release.jks
+          echo "$KEYSTORE_BASE64" | base64 --decode > android/app/keystore/katastic-release.jks
           python3 - <<'PY'
           from pathlib import Path
-          import json, os, re
-          pkg = json.loads(Path('package.json').read_text())
-          version = pkg.get('version', '1.0.0') + '+' + os.environ['VERSION_CODE']
-          gradle = Path('android/app/build.gradle')
-          if not gradle.exists():
-              raise SystemExit('android/app/build.gradle tidak ditemukan.')
-          s = gradle.read_text()
-          s, n = re.subn(r'versionCode\s+\d+', 'versionCode ' + os.environ['VERSION_CODE'], s, count=1)
-          if not n: raise SystemExit('versionCode tidak ditemukan di build.gradle')
-          s, n = re.subn(r'versionName\s+["\'][^"\']*["\']', 'versionName "' + version + '"', s, count=1)
-          if not n: raise SystemExit('versionName tidak ditemukan di build.gradle')
+          import json, re, os
+          package = json.loads(Path('package.json').read_text())
+          version = package.get('version', '1.0.0')
+          p = Path('android/app/build.gradle')
+          if not p.exists():
+              raise SystemExit('android/app/build.gradle tidak ditemukan; periksa versi Capacitor/Android project.')
+          s = p.read_text()
+          s = re.sub(r'versionCode\s+\d+', 'versionCode ' + os.environ['VERSION_CODE'], s, count=1)
+          s = re.sub(r'versionName\s+"[^"]*"', 'versionName "' + version + '+' + os.environ['VERSION_CODE'] + '"', s, count=1)
           signing = '''\nsigningConfigs {\n    release {\n        storeFile file("keystore/katastic-release.jks")\n        storePassword System.getenv("KEYSTORE_PASSWORD")\n        keyAlias System.getenv("KEY_ALIAS")\n        keyPassword System.getenv("KEY_PASSWORD")\n    }\n}\n'''
           if 'signingConfigs {' not in s:
               s = s.replace('android {', 'android {' + signing, 1)
           if 'signingConfig signingConfigs.release' not in s:
-              s, n = re.subn(r'(buildTypes\s*\{\s*release\s*\{)', r'\1\n            signingConfig signingConfigs.release', s, count=1)
-              if not n: raise SystemExit('Blok buildTypes.release tidak ditemukan.')
-          gradle.write_text(s)
-          with open(os.environ['GITHUB_ENV'], 'a') as env_file:
-              env_file.write('VERSION_NAME=' + version + '\n')
+              s, count = re.subn(r'(buildTypes\s*\{\s*release\s*\{)', r'\1\n            signingConfig signingConfigs.release', s, count=1)
+              if count == 0:
+                  raise SystemExit('Blok buildTypes.release tidak ditemukan.')
+          p.write_text(s)
           PY
 
       - name: Build signed release APK
@@ -247,23 +313,14 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x gradlew
-          ./gradlew assembleRelease
-          cp app/build/outputs/apk/release/app-release.apk "../Katastic-${VERSION_NAME}.apk"
-
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ env.VERSION_NAME }}
-          name: Katastic v${{ env.VERSION_NAME }}
-          files: ${{ env.APP_DIR }}/Katastic-${{ env.VERSION_NAME }}.apk
-          generate_release_notes: true
-          make_latest: true
+          echo "Memulai Gradle release build..."
+          time ./gradlew assembleRelease --build-cache
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: Katastic-release-${{ github.run_number }}
-          path: ${{ env.APP_DIR }}/Katastic-${{ env.VERSION_NAME }}.apk
+          path: ${{ env.APP_DIR }}/android/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
           retention-days: 30
           
